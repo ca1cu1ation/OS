@@ -1,5 +1,7 @@
 #include <default_pmm.h>
 #include <best_fit_pmm.h>
+#include <buddy_pmm.h>
+#include "slub.h"
 #include <defs.h>
 #include <error.h>
 #include <memlayout.h>
@@ -11,6 +13,7 @@
 #include <riscv.h>
 #include <dtb.h>
 
+extern void slub_selftest(void);
 // virtual address of physical page array
 struct Page *pages;
 // amount of physical memory (in pages)
@@ -34,7 +37,7 @@ static void check_alloc_page(void);
 
 // init_pmm_manager - initialize a pmm_manager instance
 static void init_pmm_manager(void) {
-    pmm_manager = &best_fit_pmm_manager;
+    pmm_manager = &buddy_pmm_manager;
     cprintf("memory management: %s\n", pmm_manager->name);
     pmm_manager->init();
 }
@@ -112,6 +115,8 @@ void pmm_init(void) {
     // detect physical memory space, reserve already used memory,
     // then use pmm->init_memmap to create free page list
     page_init();
+    slub_init();
+    slub_selftest();
 
     // use pmm->check to verify the correctness of the alloc/free function in a pmm
     check_alloc_page();

@@ -204,6 +204,10 @@ grade:
 	$(V)$(MAKE) $(MAKEOPTS) clean
 	$(V)$(SH) tools/grade.sh
 
+grade_buddy:
+	$(V)$(MAKE) $(MAKEOPTS) clean
+	$(V)$(SH) tools/grade_buddy.sh
+
 touch:
 	$(V)$(foreach f,$(TOUCH_FILES),$(TOUCH) $(f))
 
