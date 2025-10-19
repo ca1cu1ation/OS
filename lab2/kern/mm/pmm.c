@@ -37,7 +37,7 @@ static void check_alloc_page(void);
 
 // init_pmm_manager - initialize a pmm_manager instance
 static void init_pmm_manager(void) {
-    pmm_manager = &buddy_pmm_manager;
+    pmm_manager = &best_fit_pmm_manager;
     cprintf("memory management: %s\n", pmm_manager->name);
     pmm_manager->init();
 }
@@ -115,8 +115,6 @@ void pmm_init(void) {
     // detect physical memory space, reserve already used memory,
     // then use pmm->init_memmap to create free page list
     page_init();
-    slub_init();
-    slub_selftest();
 
     // use pmm->check to verify the correctness of the alloc/free function in a pmm
     check_alloc_page();
@@ -125,6 +123,10 @@ void pmm_init(void) {
     satp_virtual = (pte_t*)boot_page_table_sv39;
     satp_physical = PADDR(satp_virtual);
     cprintf("satp virtual address: 0x%016lx\nsatp physical address: 0x%016lx\n", satp_virtual, satp_physical);
+    
+    //测试best-fit时需要注释掉slub
+    slub_init();
+    slub_selftest();
 }
 
 static void check_alloc_page(void) {
