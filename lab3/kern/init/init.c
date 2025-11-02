@@ -10,6 +10,31 @@
 #include <trap.h>
 #include <dtb.h>
 
+// 测试函数定义
+static void test_illegal_instruction(void) {
+    cprintf("Testing illegal instruction...\n");
+    // 插入一条非法指令，确保正确对齐
+    asm volatile(
+        ".align 2\n\t"           // 确保4字节对齐
+        ".word 0x00000000\n\t"   // 明确的非法指令
+        ".align 2"               // 恢复对齐
+        ::: "memory"
+    );
+    cprintf("After illegal instruction\n");
+}
+
+static void test_breakpoint(void) {
+    cprintf("Testing breakpoint...\n");
+    // 插入断点指令，确保正确对齐
+    asm volatile(
+        ".align 2\n\t"           // 确保4字节对齐
+        "ebreak\n\t"             // RISC-V断点指令
+        ".align 2"               // 恢复对齐
+        ::: "memory"
+    );
+    cprintf("After breakpoint\n");
+}
+
 int kern_init(void) __attribute__((noreturn));
 void grade_backtrace(void);
 
@@ -34,6 +59,13 @@ int kern_init(void) {
 
     clock_init();   // init clock interrupt
     intr_enable();  // enable irq interrupt
+
+    // 测试非法指令异常
+    test_illegal_instruction();
+    
+    // 测试断点异常
+    test_breakpoint();
+
 
     /* do nothing */
     while (1)
