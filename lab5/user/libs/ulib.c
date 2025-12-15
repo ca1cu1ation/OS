@@ -40,6 +40,16 @@ getpid(void) {
     return sys_getpid();
 }
 
+int
+madvise_dontneed(void *addr, size_t len) {
+    return sys_madvise((uintptr_t)addr, len);
+}
+
+void *
+map_backing(void *addr, size_t len) {
+    return (void *)sys_map_backing((uintptr_t)addr, len);
+}
+
 //print_pgdir - print the PDT&PT
 void
 print_pgdir(void) {

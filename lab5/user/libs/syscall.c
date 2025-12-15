@@ -71,3 +71,13 @@ sys_pgdir(void) {
     return syscall(SYS_pgdir);
 }
 
+int
+sys_madvise(uintptr_t addr, size_t len) {
+    return syscall(SYS_madvise, addr, len);
+}
+
+uintptr_t
+sys_map_backing(uintptr_t addr, size_t len) {
+    return (uintptr_t)syscall(SYS_map_backing, addr, len);
+}
+

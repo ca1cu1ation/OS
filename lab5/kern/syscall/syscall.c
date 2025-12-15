@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <pmm.h>
 #include <assert.h>
+#include <vmm.h>
 
 static int
 sys_exit(uint64_t arg[]) {
@@ -64,16 +65,34 @@ sys_pgdir(uint64_t arg[]) {
     return 0;
 }
 
-static int (*syscalls[])(uint64_t arg[]) = {
-    [SYS_exit]              sys_exit,
-    [SYS_fork]              sys_fork,
-    [SYS_wait]              sys_wait,
-    [SYS_exec]              sys_exec,
-    [SYS_yield]             sys_yield,
-    [SYS_kill]              sys_kill,
-    [SYS_getpid]            sys_getpid,
-    [SYS_putc]              sys_putc,
-    [SYS_pgdir]             sys_pgdir,
+static int
+sys_madvise(uint64_t arg[])
+{
+    uintptr_t addr = (uintptr_t)arg[0];
+    size_t len = (size_t)arg[1];
+    return do_madvise_dontneed(current->mm, addr, len);
+}
+
+static intptr_t
+sys_map_backing(uint64_t arg[])
+{
+    uintptr_t addr = (uintptr_t)arg[0];
+    size_t len = (size_t)arg[1];
+    return do_map_backing(current->mm, addr, len);
+}
+
+static intptr_t (*syscalls[])(uint64_t arg[]) = {
+    [SYS_exit]              (intptr_t (*)(uint64_t[]))sys_exit,
+    [SYS_fork]              (intptr_t (*)(uint64_t[]))sys_fork,
+    [SYS_wait]              (intptr_t (*)(uint64_t[]))sys_wait,
+    [SYS_exec]              (intptr_t (*)(uint64_t[]))sys_exec,
+    [SYS_yield]             (intptr_t (*)(uint64_t[]))sys_yield,
+    [SYS_kill]              (intptr_t (*)(uint64_t[]))sys_kill,
+    [SYS_getpid]            (intptr_t (*)(uint64_t[]))sys_getpid,
+    [SYS_putc]              (intptr_t (*)(uint64_t[]))sys_putc,
+    [SYS_pgdir]             (intptr_t (*)(uint64_t[]))sys_pgdir,
+    [SYS_madvise]           (intptr_t (*)(uint64_t[]))sys_madvise,
+    [SYS_map_backing]       sys_map_backing,
 };
 
 #define NUM_SYSCALLS        ((sizeof(syscalls)) / (sizeof(syscalls[0])))

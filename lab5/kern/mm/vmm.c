@@ -8,6 +8,10 @@
 #include <riscv.h>
 #include <kmalloc.h>
 
+// 打开为 1 表示启用 Dirty COW 修复（加锁 + 禁止写穿后备页）
+// 保持为 0 表示处于“漏洞态”
+#define FIX_DIRTY_COW 0
+
 /*
   vmm design include two parts: mm_struct (mm) & vma_struct (vma)
   mm is the memory manager for the set of continuous virtual memory
@@ -46,6 +50,10 @@ volatile unsigned int pgfault_num = 0;
 int do_pgfault(struct mm_struct *mm, uint32_t error_code, uintptr_t addr)
 {
     int ret = -E_INVAL;
+    // 修复态：对同一 mm 的页表改动整体加锁，覆盖 get_pte/*ptep 判定 + page_insert 等关键区
+#if FIX_DIRTY_COW
+    lock_mm(mm);
+#endif
     struct vma_struct *vma = find_vma(mm, addr);
 
     pgfault_num++;
@@ -78,6 +86,61 @@ int do_pgfault(struct mm_struct *mm, uint32_t error_code, uintptr_t addr)
             goto failed;
         }
     }
+
+    // backing-page fast path: if addr in backing range,优先处理与后备页相关的缺页
+    extern struct Page *backing_page_global;
+    if (backing_page_global != NULL &&
+        mm != NULL &&
+        mm->backing_start != 0 &&
+        addr >= mm->backing_start && addr < mm->backing_end)
+    {
+        uintptr_t va = ROUNDDOWN(addr, PGSIZE);
+        uint32_t perm = PTE_U | PTE_R;
+#if !FIX_DIRTY_COW
+        // 漏洞态：写 fault 直接加写权限，允许写穿后备页
+        if (error_code & 0x2)
+        {
+            perm |= PTE_W;
+        }
+        if (page_insert(mm->pgdir, backing_page_global, va, perm) != 0)
+        {
+            cprintf("backing map failed\n");
+            goto failed;
+        }
+        ret = 0;
+        goto done;
+#else
+        // 修复态：禁止直接写穿后备页，写 fault 对 backing_page_global 做一次 COW
+        if (error_code & 0x2)
+        {
+            // 写 fault：分配新页，拷贝 backing_page_global 内容，仅当前 VA 映射为可写
+            struct Page *page = alloc_page();
+            if (page == NULL)
+            {
+                cprintf("backing COW alloc failed\n");
+                goto failed;
+            }
+            memcpy(page2kva(page), page2kva(backing_page_global), PGSIZE);
+            if (page_insert(mm->pgdir, page, va, PTE_U | PTE_R | PTE_W) != 0)
+            {
+                free_page(page);
+                cprintf("backing COW page_insert failed\n");
+                goto failed;
+            }
+        }
+        else
+        {
+            // 读 fault：继续共享只读 backing_page_global
+            if (page_insert(mm->pgdir, backing_page_global, va, PTE_U | PTE_R) != 0)
+            {
+                cprintf("backing map failed\n");
+                goto failed;
+            }
+        }
+        ret = 0;
+        goto done;
+#endif
+    }
     
     // Calculate permissions based on VMA flags
     uint32_t perm = PTE_U;
@@ -103,58 +166,201 @@ int do_pgfault(struct mm_struct *mm, uint32_t error_code, uintptr_t addr)
         goto failed;
     }
 
-    if (*ptep == 0)
+    if (*ptep == 0 || ((*ptep & PTE_V) == 0))
     {
-        // if the phy addr isn't exist, then alloc a page & map the phy addr with logical addr
+        // Missing mapping: alloc anonymous or backing mapping already handled above
         if (pgdir_alloc_page(mm->pgdir, addr, perm) == NULL)
         {
             cprintf("pgdir_alloc_page in do_pgfault failed\n");
             goto failed;
         }
     }
-    else
+    else if ((*ptep & PTE_COW) && (error_code & 0x2))
     {
-        // Page exists, check if this is a COW page
-        // Check if this is a COW page and it's a write operation
-        // error_code format: bit 1 = write (1) or read (0)
-        if ((*ptep & PTE_COW) && (error_code & 0x2))
+        // COW: Copy the page
+        struct Page *page = alloc_page();
+        if (page == NULL)
         {
-            // COW: Copy the page
-            struct Page *page = alloc_page();
-            if (page == NULL)
-            {
-                cprintf("do_pgfault failed: cannot allocate page for COW\n");
-                goto failed;
-            }
-
-            struct Page *old_page = pte2page(*ptep);
-            // Copy the page content
-            void *src_kvaddr = page2kva(old_page);
-            void *dst_kvaddr = page2kva(page);
-            memcpy(dst_kvaddr, src_kvaddr, PGSIZE);
-
-            // Update the page table entry with the new page
-            // Restore full permissions based on VMA (remove COW flag, restore write if needed)
-            // Note: page_insert will handle removing the old mapping and decreasing old_page's ref count
-            uint32_t new_perm = perm; // perm already contains the correct permissions from VMA
-            if (page_insert(mm->pgdir, page, addr, new_perm) != 0)
-            {
-                free_page(page);
-                cprintf("do_pgfault failed: cannot insert page for COW\n");
-                goto failed;
-            }
+            cprintf("do_pgfault failed: cannot allocate page for COW\n");
+            goto failed;
         }
-        else
+
+        struct Page *old_page = pte2page(*ptep);
+        // Copy the page content
+        void *src_kvaddr = page2kva(old_page);
+        void *dst_kvaddr = page2kva(page);
+        memcpy(dst_kvaddr, src_kvaddr, PGSIZE);
+
+        uint32_t new_perm = perm; // restore full permissions from VMA
+        if (page_insert(mm->pgdir, page, addr, new_perm) != 0)
         {
-            // Normal page fault: page exists but permissions are wrong
-            // This should not happen with proper COW implementation
-            cprintf("do_pgfault: page exists but permission denied\n");
+            free_page(page);
+            cprintf("do_pgfault failed: cannot insert page for COW\n");
             goto failed;
         }
     }
+    else
+    {
+        // Page exists but permissions insufficient: fix up per VMA
+#if FIX_DIRTY_COW
+        // 修复态：backing 区域不允许走“权限修正”分支，避免把只读 backing 映射改成可写
+        if (mm->backing_start != 0 &&
+            addr >= mm->backing_start && addr < mm->backing_end)
+        {
+            goto failed;
+        }
+#endif
+        uint32_t ppn = PTE_ADDR(*ptep) >> PGSHIFT;
+        uint32_t new_pte = pte_create(ppn, PTE_V | perm);
+        *ptep = new_pte;
+        tlb_invalidate(mm->pgdir, addr);
+    }
     ret = 0;
 failed:
+#if FIX_DIRTY_COW
+    unlock_mm(mm);
+#endif
     return ret;
+done:
+#if FIX_DIRTY_COW
+    unlock_mm(mm);
+#endif
+    return ret;
+}
+
+// A minimalist madvise(MADV_DONTNEED) analog, intentionally without locking
+// to allow race windows for Dirty COW style testing.
+int do_madvise_dontneed(struct mm_struct *mm, uintptr_t addr, size_t len)
+{
+    if (mm == NULL || len == 0)
+    {
+        return 0;
+    }
+#if FIX_DIRTY_COW
+    // 修复态：对同一 mm 的页表改动加锁，关闭 COW+madvise 竞态窗口
+    lock_mm(mm);
+#endif
+    uintptr_t start = ROUNDDOWN(addr, PGSIZE);
+    uintptr_t end = ROUNDUP(addr + len, PGSIZE);
+    if (!USER_ACCESS(start, end) || start >= end)
+    {
+#if FIX_DIRTY_COW
+        unlock_mm(mm);
+#endif
+        return -E_INVAL;
+    }
+    // if this range is the backing range, only clear PTEs without freeing backing_page
+    if (mm->backing_start != 0 &&
+        start >= mm->backing_start && end <= mm->backing_end)
+    {
+        for (uintptr_t va = start; va < end; va += PGSIZE)
+        {
+            pte_t *ptep = get_pte(mm->pgdir, va, 0);
+            if (ptep && (*ptep & PTE_V))
+            {
+                *ptep = 0;
+                tlb_invalidate(mm->pgdir, va);
+            }
+        }
+    }
+    else
+    {
+        // 非后备区：仍走普通 unmap_range
+        unmap_range(mm->pgdir, start, end);
+    }
+#if FIX_DIRTY_COW
+    unlock_mm(mm);
+#endif
+    return 0;
+}
+
+// Global backing page to simulate page cache
+struct Page *backing_page_global = NULL;
+
+// simple unmapped-area finder: pick a start and bump until no overlap
+static uintptr_t simple_get_unmapped_area(struct mm_struct *mm, size_t len)
+{
+    uintptr_t start = 0x40000000;
+    uintptr_t end = 0;
+    size_t l = ROUNDUP(len, PGSIZE);
+    while (1)
+    {
+        end = start + l;
+        if (!USER_ACCESS(start, end) || start >= end)
+        {
+            return (uintptr_t)-1;
+        }
+        struct vma_struct *vma = find_vma(mm, start);
+        if (vma == NULL || end <= vma->vm_start)
+        {
+            return start;
+        }
+        start = ROUNDDOWN(vma->vm_end + PGSIZE, PGSIZE);
+    }
+}
+
+uintptr_t do_map_backing(struct mm_struct *mm, uintptr_t addr, size_t len)
+{
+    if (mm == NULL || len == 0)
+    {
+        cprintf("map_backing: invalid mm/len mm=%p len=%lx\n", mm, len);
+        return -E_INVAL;
+    }
+    uintptr_t start, end;
+
+    if (addr == 0)
+    {
+        start = simple_get_unmapped_area(mm, len);
+        if (start == 0 || start == (uintptr_t)-1)
+        {
+            cprintf("map_backing: get_unmapped_area failed len=%lx\n", len);
+            return -E_NO_MEM;
+        }
+        end = start + ROUNDUP(len, PGSIZE);
+    }
+    else
+    {
+        start = ROUNDDOWN(addr, PGSIZE);
+        end = ROUNDUP(addr + len, PGSIZE);
+        if (!USER_ACCESS(start, end) || start >= end)
+        {
+            cprintf("map_backing: USER_ACCESS fail start=%lx end=%lx\n", start, end);
+            return -E_INVAL;
+        }
+    }
+
+    if (backing_page_global == NULL)
+    {
+        backing_page_global = alloc_page();
+        if (backing_page_global == NULL)
+        {
+            cprintf("map_backing: alloc_page fail\n");
+            return -E_NO_MEM;
+        }
+        memset(page2kva(backing_page_global), 'P', PGSIZE);
+    }
+
+    // ensure VMA exists for this range so find_vma works on faults
+    struct vma_struct *vma = NULL;
+    if (mm_map(mm, start, end - start, VM_READ | VM_WRITE, &vma) != 0)
+    {
+        cprintf("map_backing: mm_map fail start=%lx end=%lx\n", start, end);
+        return -E_NO_MEM;
+    }
+
+    // record backing region in mm
+    mm->backing_start = start;
+    mm->backing_end = end;
+
+    // map backing page as read-only initially
+    for (uintptr_t va = start; va < end; va += PGSIZE)
+    {
+        if (page_insert(mm->pgdir, backing_page_global, va, PTE_U | PTE_R) != 0)
+        {
+            return -E_NO_MEM;
+        }
+    }
+    return start;
 }
 
 // mm_create -  alloc a mm_struct & initialize it.
@@ -174,6 +380,8 @@ mm_create(void)
 
         set_mm_count(mm, 0);
         lock_init(&(mm->mm_lock));
+        mm->backing_start = 0;
+        mm->backing_end = 0;
     }
     return mm;
 }

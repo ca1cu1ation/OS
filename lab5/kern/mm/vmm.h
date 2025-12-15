@@ -38,6 +38,9 @@ struct mm_struct
     void *sm_priv;                 // the private data for swap manager
     int mm_count;                  // the number ofprocess which shared the mm
     lock_t mm_lock;                // mutex for using dup_mmap fun to duplicat the mm
+    // backing mapping for Dirty COW simulation
+    uintptr_t backing_start;
+    uintptr_t backing_end;
 };
 
 struct vma_struct *find_vma(struct mm_struct *mm, uintptr_t addr);
@@ -64,6 +67,8 @@ bool copy_from_user(struct mm_struct *mm, void *dst, const void *src, size_t len
 bool copy_to_user(struct mm_struct *mm, void *dst, const void *src, size_t len);
 
 int do_pgfault(struct mm_struct *mm, uint32_t error_code, uintptr_t addr);
+int do_madvise_dontneed(struct mm_struct *mm, uintptr_t addr, size_t len);
+uintptr_t do_map_backing(struct mm_struct *mm, uintptr_t addr, size_t len);
 
 static inline int
 mm_count(struct mm_struct *mm)

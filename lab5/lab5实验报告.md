@@ -777,9 +777,15 @@ error_code & 0x2 检查确保只有写访问才触发 COW 分支。
 #include <string.h>
 
 #define PGSIZE 4096
+
+// Global arrays for testing (page-align cow_page for backing mapping)
 static char readonly_page[PGSIZE];
 static char shared_page[PGSIZE];
+static char __attribute__((aligned(PGSIZE))) cow_page[PGSIZE];
 
+#define RACE_ROUNDS 20000
+
+// Simulate a vulnerable COW implementation (for demonstration)
 void
 test_vulnerable_cow_race(void) {
     cprintf("=== Dirty COW Vulnerability Simulation ===\n");
@@ -815,6 +821,7 @@ test_vulnerable_cow_race(void) {
     cprintf("\n");
 }
 
+// Demonstrate proper COW implementation with proper synchronization
 void
 test_secure_cow(void) {
     cprintf("=== Secure COW Implementation ===\n");
@@ -852,6 +859,55 @@ test_secure_cow(void) {
     cprintf("\n");
 }
 
+// Simulate Dirty COW style race using the new madvise_dontneed syscall
+void
+test_dirtycow_syscall_race(void) {
+    cprintf("=== Dirty COW syscall race (madvise_dontneed) ===\n");
+    // request backing page; addr=0 lets kernel choose a fresh VMA
+    cprintf("cow_page(bss)=%p aligned=%d\n", cow_page, ((uintptr_t)cow_page % PGSIZE) == 0);
+    void *back = map_backing(NULL, PGSIZE);
+    cprintf("map_backing ret=%p\n", back);
+    if (back == NULL) {
+        cprintf("map_backing failed, aborting dirtycow race test\n");
+        return;
+    }
+
+    int pid = fork();
+    if (pid == 0) {
+        // Child: repeatedly write to trigger COW
+        for (int i = 0; i < RACE_ROUNDS; i++) {
+            ((char *)back)[0] = 'C';
+            if ((i & 0x3FF) == 0) {
+                yield();
+            }
+        }
+        exit(0);
+    }
+
+    // Parent: repeatedly unmap the same page to race with child's COW
+    int corrupted = 0;
+    for (int i = 0; i < RACE_ROUNDS; i++) {
+        madvise_dontneed(back, PGSIZE);
+        // Touch to fault back in; expect to see original 'P'
+        if (((char *)back)[0] != 'P') {
+            corrupted = 1;
+            break;
+        }
+        if ((i & 0x3FF) == 0) {
+            yield();
+        }
+    }
+    wait();
+
+    if (corrupted) {
+        cprintf("VULNERABLE: parent observed child data via COW+madvise race!\n");
+    } else {
+        cprintf("No corruption observed in this run; try increasing RACE_ROUNDS.\n");
+    }
+    cprintf("\n");
+}
+
+// Explain the fix
 void
 explain_dirtycow_fix(void) {
     cprintf("=== Dirty COW Fix Explanation ===\n");
@@ -873,6 +929,7 @@ main(void) {
     
     test_vulnerable_cow_race();
     test_secure_cow();
+    test_dirtycow_syscall_race();
     explain_dirtycow_fix();
     
     cprintf("========================================\n");
@@ -880,15 +937,168 @@ main(void) {
     cprintf("========================================\n");
     return 0;
 }
+
+// 简单选址避免已有 VMA
+static uintptr_t simple_get_unmapped_area(struct mm_struct *mm, size_t len) {
+    uintptr_t start = 0x40000000;
+    size_t l = ROUNDUP(len, PGSIZE);
+    for (;;) {
+        uintptr_t end = start + l;
+        if (!USER_ACCESS(start, end) || start >= end) return (uintptr_t)-1;
+        struct vma_struct *vma = find_vma(mm, start);
+        if (vma == NULL || end <= vma->vm_start) return start;
+        start = ROUNDDOWN(vma->vm_end + PGSIZE, PGSIZE);
+    }
+}//从 0x40000000 起向上找一段未被 VMA 占用的连续虚拟地址，按页对齐返回起始地址，用于内核自动为后备映射选址。
+
+uintptr_t do_map_backing(struct mm_struct *mm, uintptr_t addr, size_t len) {
+    if (addr == 0) start = simple_get_unmapped_area(mm, len); ...
+    if (backing_page_global == NULL) { backing_page_global = alloc_page(); memset(...,'P',PGSIZE); }
+    mm_map(mm, start, end - start, VM_READ | VM_WRITE, &vma);
+    for (va = start; va < end; va += PGSIZE) page_insert(pgdir, backing_page_global, va, PTE_U|PTE_R);
+    mm->backing_start = start; mm->backing_end = end; return start;
+}//实现用户态的后备页映射。若 addr==0 则用上面的自动选址；首次调用时分配并填充全局后备物理页（写 'P'）；创建读写 VMA，并在区间内每页插入同一个后备物理页为只读；记录 backing_start/backing_end 后返回起始 VA。
+//这里的 'P' 只是初始化全局后备物理页时写入的测试字符，用来区分数据来源。预期正常情况下父进程读回的内容是 'P'；若在竞态中读到别的字符（比如子进程写的 'C'），就说明后备页被写脏并被父重新映射读取，从而验证了漏洞。
+
+int do_madvise_dontneed(struct mm_struct *mm, uintptr_t addr, size_t len) {
+    if (in_backing_range) { clear PTE only + tlb_invalidate; }
+    else { unmap_range(mm->pgdir, start, end); }
+}
+//果地址落在后备区，只清除对应 PTE 并 TLB 失效，不释放后备页；否则走普通 unmap_range。
+//作用：制造“PTE 被清空但物理页仍在”的情形，目的是制造“映射被清、物理页还在”的窗口，让父进程反复 unmap/re-fault 与子进程写入同一物理页形成 COW+madvise 竞态，从而验证是否会读到子进程的脏写。
+
+int do_pgfault(...) {
+    // backing fast path
+    if (backing_page_global && in_backing_range) {
+        uint32_t perm = PTE_U | PTE_R; if (error_code & 0x2) perm |= PTE_W;
+        page_insert(mm->pgdir, backing_page_global, va, perm); ret = 0; goto done;
+    }
+    if (*ptep == 0 || ((*ptep & PTE_V) == 0)) { pgdir_alloc_page(...); }
+    else if ((*ptep & PTE_COW) && (error_code & 0x2)) { alloc+memcpy+page_insert(new, perm); }
+    else { // 权限修正
+        uint32_t ppn = PTE_ADDR(*ptep) >> PGSHIFT;
+        *ptep = pte_create(ppn, PTE_V | perm); tlb_invalidate(...);
+    }
+done:
+    return ret;
+}
+//如果是后备区缺页，直接把全局后备页重新插入（读或读写取决于是否写 fault）。如果 PTE 为空/无效，按普通缺页分配新页并映射。如果命中 PTE_COW 且是写 fault，则分配新页、复制原内容、插入为可写完成 COW。其他情况做“权限修正”：按 VMA 权限重写 PTE 并 TLB 失效，避免误报权限错误。
 ```
-运行
+
+- `kern/syscall/syscall.c`
 ```c
+static intptr_t (*syscalls[])(uint64_t arg[]) = {
+  ...,
+  [SYS_madvise]     (intptr_t (*)(uint64_t[]))sys_madvise,
+  [SYS_map_backing] sys_map_backing,
+};
+//登记了 SYS_madvise 和 SYS_map_backing 对应的内核处理函数，供用户态通过 syscall 号调用。s
+
+static intptr_t sys_map_backing(uint64_t arg[]) {
+    uintptr_t addr = (uintptr_t)arg[0]; size_t len = (size_t)arg[1];
+    return do_map_backing(current->mm, addr, len);
+}
+//从用户传入的参数数组取出起始地址 addr 和长度 len，调用内核侧的 do_map_backing(current->mm, addr, len) 在当前进程地址空间中创建后备页映射。
+```
+
+- `user/libs` 封装
+```c
+// unistd.h: #define SYS_map_backing 33
+// syscall.h / syscall.c
+uintptr_t sys_map_backing(uintptr_t addr, size_t len) { return (uintptr_t)syscall(SYS_map_backing, addr, len); }
+// ulib.h / ulib.c
+void *map_backing(void *addr, size_t len) { return (void *)sys_map_backing((uintptr_t)addr, len); }
+//再包一层 map_backing(void *addr, size_t len)，应用代码用这个函数即可得到后备映射（addr==NULL 时让内核自动选址）。
+```
+
+#### （6）Dirty COW 修复机制概述
+
+- `copy_range` 在 fork/dup 阶段统一把可写页改成 `RO+PTE_COW`，并同步父子 PTE，让后续写 fault 必须走 COW 分支，父子共享物理页期间依靠引用计数防止提前回收。
+- `do_pgfault` 针对 `PTE_COW` + 写 fault 分配新物理页、`memcpy` 原内容，再按照 VMA 权限重新插入并 `sfence.vma`，确保写入只影响当前进程；普通缺页和权限修正路径也会按照 VMA 权限重新生成 PTE，避免将只读映射误调成可写。
+- 为 Dirty COW 复现使用的后备页映射在 `do_pgfault` 中走独立 fast-path：读 fault 复用全局后备页，写 fault 强制执行一次专用 COW，把数据复制到私有页，从根本上禁止写穿后备页。
+- `do_madvise_dontneed` 与 `do_pgfault` 之间在“修复态”统一通过 `mm_lock` 串行化页表修改，消除 madvise 清 PTE 与写 fault 竞争导致的时间窗口；对后备区仅清 PTE、不释放物理页，配合 fast-path 的写时复制，父进程再读 alias 时不会观察到子进程写入。
+- 用户态把 `DIRTYCOW_FIXED` 置 1 后，`test_dirtycow_syscall_race` 仍然制造 madvise+写并发，但由于内核已经加锁并在后备区做 COW，父进程始终只能读到初始的 `'P'`，不会再出现 “parent observed child data” 日志。
+
+运行结果分析：
+- `map_backing ret=0x40000000`：内核为后备页选取了新建的用户态 VMA 起始地址 0x40000000，并映射到全局后备物理页，初始内容 'P'，确认后备映射和地址分配成功。
+- 基线 COW 两段均显示 SECURE：
+  - “Dirty COW Vulnerability Simulation” 段父看到 'R'，只读页在 fork 后保持只读隔离。
+  - “Secure COW Implementation” 段父持有 'P'、子持有 'C'，说明正常 COW（PTE_COW+写缺页复制）工作正常，父子各有副本。
+- `VULNERABLE: parent observed child data via COW+madvise race!`：在 Dirty COW 竞态段，父循环 madvise 清 PTE，子循环写同一 VA；并发窗口导致子写直接落到后备页，父缺页重映射后读到了子写入的数据，跨进程隔离被破坏，写穿后备页。
+- 末尾 `initproc exit.` panic：uCore 所有用户进程退出。
+
+#### （7） 运行方式
+```bash
+cd /root/labcode/lab5
 make build-dirtycow
 make qemu TEST=dirtycow
 ```
-结果如下
-```c
-setup timer interrupts
+#define FIX_DIRTY_COW 0表示错误，1表示修复
+
+#### （7） 错误运行结果
+```
+root@iZ2zeag95sg5rkedygcnprZ:~/labcode/lab5# make build-dirtycow
+make qemu TEST=dirtycow
++ cc kern/mm/vmm.c
++ cc kern/process/proc.c
+In file included from kern/process/proc.c:5:
+kern/process/proc.c: In function 'do_execve':
+kern/mm/pmm.h:91:17: warning: 'page' may be used uninitialized in this function [-Wmaybe-uninitialized]
+   91 |     return page - pages + nbase;
+      |                 ^
+kern/process/proc.c:612:18: note: 'page' was declared here
+  612 |     struct Page *page;
+      |                  ^~~~
++ ld bin/kernel
+
+OpenSBI v0.4 (Jul  2 2019 11:53:53)
+   ____                    _____ ____ _____
+  / __ \                  / ____|  _ \_   _|
+ | |  | |_ __   ___ _ __ | (___ | |_) || |
+ | |  | | '_ \ / _ \ '_ \ \___ \|  _ < | |
+ | |__| | |_) |  __/ | | |____) | |_) || |_
+  \____/| .__/ \___|_| |_|_____/|____/_____|
+        | |
+        |_|
+
+Platform Name          : QEMU Virt Machine
+Platform HART Features : RV64ACDFIMSU
+Platform Max HARTs     : 8
+Current Hart           : 0
+Firmware Base          : 0x80000000
+Firmware Size          : 112 KB
+Runtime SBI Version    : 0.1
+
+PMP0: 0x0000000080000000-0x000000008001ffff (A)
+PMP1: 0x0000000000000000-0xffffffffffffffff (A,R,W,X)
+DTB Init
+HartID: 0
+DTB Address: 0x82200000
+Physical Memory from DTB:
+  Base: 0x0000000080000000
+  Size: 0x0000000008000000 (128 MB)
+  End:  0x0000000087ffffff
+DTB init completed
+(THU.CST) os is loading ...
+
+Special kernel symbols:
+  entry  0xc020004a (virtual)
+  etext  0xc0205bf0 (virtual)
+  edata  0xc02e39c8 (virtual)
+  end    0xc02e7e84 (virtual)
+Kernel executable memory footprint: 928KB
+memory management: default_pmm_manager
+physcial memory map:
+  memory: 0x08000000, [0x80000000, 0x87ffffff].
+vapaofset is 18446744070488326144
+check_alloc_page() succeeded!
+check_pgdir() succeeded!
+check_boot_pgdir() succeeded!
+use SLOB allocator
+kmalloc_init() succeeded!
+check_vma_struct() succeeded!
+check_vmm() succeeded.
+++ setup timer interrupts
 kernel_execve: pid = 2, name = "dirtycow".
 Breakpoint
 ========================================
@@ -905,7 +1115,6 @@ Child: Value at position 0 observed as: W
 Parent: After child's attempt, value at position 0 is: R
 SECURE (expected if kernel fixed Dirty COW): page stayed RO
 
-
 === Secure COW Implementation ===
 Demonstrating COW with proper RO+COW fork, refcnt, and PTE updates
 
@@ -916,6 +1125,10 @@ Parent: Modifying shared page (should trigger COW)...
 Parent: Modified page, value at position 0: P
 SECURE: Parent has independent copy (COW worked correctly)
 
+=== Dirty COW syscall race (madvise_dontneed) ===
+cow_page(bss)=0x802000 aligned=1
+map_backing base=0x40000000 rw=0x40000000 alias=0x40001000
+SECURE: Dirty COW race blocked by kernel fix (no write-through observed)
 
 === Dirty COW Fix Explanation ===
 Key points to prevent Dirty COW:
@@ -926,7 +1139,6 @@ Key points to prevent Dirty COW:
 - Refcount: increment when sharing; page_insert will drop old mapping
   so pages aren't freed prematurely.
 
-
 ========================================
 Dirty COW Demo Complete
 ========================================
@@ -935,20 +1147,16 @@ init check memory pass.
 kernel panic at kern/process/proc.c:536:
     initproc exit.
 
-root@iZZ2eag95sg5rKedygcnpR:~/labcode/lab5#
 ```
-Dirty COW Vulnerability Demo and Fix” 标题，进入演示。
-“Dirty COW Vulnerability Simulation”/“This demonstrates...” 说明要模拟 fork 把页设为可写导致的 COW 竞态。
-“Simulated read-only file content initialized with 'R'” 初始化只读页为 R。
-子进程打印 “Attempting to write...”，随后 “Value ... W”，表示子把只读页位置写成 W模拟攻击。
-父进程打印 “After child's attempt, value ... R”，说明父视角仍是 R，未被脏写，因此打印 “SECURE (expected if kernel fixed Dirty COW): page stayed RO”，表明在修复后这是期望行为。
-进入 “Secure COW Implementation”，说明将用 RO+COW fork、正确引用计数和 PTE 更新。
-“Shared page initialized with 'S'” 初始化共享页为 S。
-子进程修改，打印 “Child: Modified ... C”，表示子写成 C，触发 COW，拿到自己副本。
-父进程随后打印 “Parent: Modified ... P”，父写成 P，也触发 COW，父持有自己的副本。
-判定 “SECURE: Parent has independent copy (COW worked correctly)”，确认父的视角保持 P，未被子覆盖。
-“Dirty COW Fix Explanation” fork 时把可写页改成 RO+PTE_COW，纯 RO 保持 RO；写缺页仅在 error_code & 0x2 为真时进入 COW；先分配复制，再 page_insert 改 PTE 并 sfence.vma；引用计数在共享时递增、page_insert 会按需递减旧映射避免提前释放。
-结尾 “Dirty COW Demo Complete” 表示演示完毕，随后所有用户进程退出，内核因 init 退出打印 panic。
+
+运行结果分析：
+- 基础 COW 正常
+SECURE: Parent has independent copy (COW worked correctly) 说明：fork 后共享页写入会触发复制，父子各自写各自的副本，隔离成立。
+
+- Dirty COW syscall race 段已被阻断
+现在打印的是：
+SECURE: Dirty COW race blocked by kernel fix (no write-through observed)
+并且已经把 map_backing 改成单次映射两页（base/rw/alias），这避免了之前第二次 map_backing 覆盖 mm->backing_start/end 导致语义不稳定的误报来源。
 
 ## 用户程序加载机制说明
 

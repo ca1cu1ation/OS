@@ -31,10 +31,10 @@ DTB init completed
 
 Special kernel symbols:
   entry  0xc020004a (virtual)
-  etext  0xc02058fa (virtual)
-  edata  0xc02da690 (virtual)
-  end    0xc02deb44 (virtual)
-Kernel executable memory footprint: 891KB
+  etext  0xc0205c00 (virtual)
+  edata  0xc02e3c58 (virtual)
+  end    0xc02e8114 (virtual)
+Kernel executable memory footprint: 929KB
 memory management: default_pmm_manager
 physcial memory map:
   memory: 0x08000000, [0x80000000, 0x87ffffff].

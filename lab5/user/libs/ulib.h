@@ -30,6 +30,8 @@ int waitpid(int pid, int *store);
 void yield(void);
 int kill(int pid);
 int getpid(void);
+int madvise_dontneed(void *addr, size_t len);
+void *map_backing(void *addr, size_t len);
 void print_pgdir(void);
 
 #endif /* !__USER_LIBS_ULIB_H__ */

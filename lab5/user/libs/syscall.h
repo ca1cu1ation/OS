@@ -1,3 +1,5 @@
+#include <defs.h>
+
 #ifndef __USER_LIBS_SYSCALL_H__
 #define __USER_LIBS_SYSCALL_H__
 
@@ -9,6 +11,8 @@ int sys_kill(int64_t pid);
 int sys_getpid(void);
 int sys_putc(int64_t c);
 int sys_pgdir(void);
+int sys_madvise(uintptr_t addr, size_t len);
+uintptr_t sys_map_backing(uintptr_t addr, size_t len);
 
 #endif /* !__USER_LIBS_SYSCALL_H__ */
 

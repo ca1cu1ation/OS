@@ -40,10 +40,46 @@
 4. 减少原页面引用计数
 5. 更新PTE，恢复完整权限（移除COW标志）
 
+## 状态转换（有限状态机视图）
+
+| 状态 | 描述 | 关键代码 |
+| --- | --- | --- |
+| `Unmapped` | 页表项为空 | `kern/mm/vmm.c:88-114` |
+| `PrivateWritable` | 单进程可写 (`PTE_W`)，无`PTE_COW` | `pgdir_alloc_page` / `page_insert` |
+| `SharedCOW` | 父子共享，PTE只读+`PTE_COW` | `kern/mm/pmm.c:395-438 copy_range` |
+| `Copying` | 缺页处理中分配、复制新页 | `kern/mm/vmm.c:120-146` |
+| `Released` | 引用计数归零后释放 | `page_remove_pte` |
+
+关键转换：
+1. `PrivateWritable → SharedCOW`：`fork` 调用 `copy_range` 时检测到 `PTE_W`，将父子PTE都改成只读+`PTE_COW`，共享物理页且 `page_ref_inc`。
+2. `SharedCOW → Copying`：写缺页(`CAUSE_STORE_PAGE_FAULT`)，`do_pgfault`看到`PTE_COW`且`error_code`写位为1。
+3. `Copying → PrivateWritable`：分配新页、`memcpy`、`page_insert` 恢复原权限并移除`PTE_COW`。
+4. `SharedCOW → Released`：某一映射被删除（进程退出/munmap），`page_remove_pte` 让引用计数-1，若为最后引用则回到 `Unmapped`。
+5. `Unmapped → PrivateWritable`：首次缺页由 `pgdir_alloc_page` 分配。
+6. `SharedCOW → PrivateWritable`：当最后一个共享者触发写缺页后通过复制获得独占页。
+
 ### 引用计数管理
 - Fork时：共享页面的引用计数+1
 - COW复制后：原页面引用计数-1，新页面引用计数从0变为1（通过page_insert）
 - 进程退出时：page_remove_pte会减少引用计数，当引用计数为0时释放页面
+
+## Dirty COW 模拟与修复
+
+- `user/dirtycow.c` 中的 `test_vulnerable_cow_race()` 假设fork未降权，会看到“VULNERABLE”输出；当前实现因为fork时去掉 `PTE_W`，实际运行会落在“SECURE”路径。
+- `test_secure_cow()` 针对共享页先写触发COW，再次验证父子写入互不干扰。
+- `explain_dirtycow_fix()` 解释修复要点：fork阶段标记`PTE_COW`、`do_pgfault`只在写缺页复制、`page_insert`恢复权限并由 `sfence.vma`/`tlb_invalidate` 保持TLB一致。这与 Linux Dirty COW 补丁思路一致。
+
+## 测试用例
+
+| 测试程序 | 说明 |
+| --- | --- |
+| `user/cow_basic.c` | 父子写不同页，验证基本COW |
+| `user/cow_multi.c` | 多页共享+部分写，确认按页触发COW |
+| `user/cow_ro.c` | 只读段共享，不触发COW |
+| `user/cow_concurrent.c` | 父子并发写同页不同偏移，检查隔离 |
+| `user/dirtycow.c` | 脏牛漏洞模拟与修复讲解 |
+
+运行：`make qemu TEST=<program>`。这些测试涵盖基本、并发、只读及安全性场景。
 
 ## 验证建议
 
@@ -76,6 +112,5 @@
 - 权限恢复逻辑
 
 建议进行实际测试以验证正确性。
-
 
 

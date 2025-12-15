@@ -20,6 +20,8 @@
 #define SYS_shmem           22
 #define SYS_putc            30
 #define SYS_pgdir           31
+#define SYS_madvise         32
+#define SYS_map_backing     33
 
 /* SYS_fork flags */
 #define CLONE_VM            0x00000100  // set if VM shared between processes
