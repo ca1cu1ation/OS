@@ -675,11 +675,13 @@ struct sfs_disk_inode {
 
 通过上述设计，ucore 可以支持标准的 UNIX 链接机制，增强文件系统的灵活性和兼容性。
 
-### 实验运行结果
+## 实验运行结果
 
-**进入sh用户执行界面**
+### 一、测试 sh 用户程序执行
 
-输入make qemu，进入sh用户执行界面
+**进入 sh 用户执行界面**
+
+输入 `make qemu` ，进入sh用户执行界面
 ```bash
 root@LAPTOP-N6OUKIU2:/mnt/e/labcode/lab8# make qemu
 
@@ -743,7 +745,7 @@ user sh is running!!!
 $ 
 ```
 
-sh启动成功后，可以在用户界面输入user目录下的文件名，执行对应程序。
+sh 启动成功后，可以在用户界面输入 user 目录下的文件名，执行对应程序。
 
 下面展示几个程序的执行结果：
 
@@ -755,7 +757,7 @@ I am process 4.
 hello pass.
 ```
 
-程序成功加载并输出信息，证明 load_icode 能够正确解析并加载 ELF 格式文件。
+执行 hello ，程序成功加载并输出信息，证明 load_icode 能够正确解析并加载 ELF 格式文件。
 
 2. **执行fortest程序**
 
@@ -808,7 +810,7 @@ waitpid 9 ok.
 exit pass.
 ```
 
-程序成功加载并输出信息，然后退出，证明 load_icode 能够正确解析并加载 ELF 格式文件。
+执行 exit，程序成功加载并输出信息，然后退出，证明 load_icode 能够正确解析并加载 ELF 格式文件。
 
 4. **执行testbss程序**
 
@@ -822,3 +824,15 @@ error: -9 - process is killed
 ```
 
 执行 testbss，程序验证了 BSS 段已被正确清零。随后程序尝试非法写入内存，触发缺页异常并被内核终止，符合预期。
+
+### 二、测试 make grade
+
+输入 `make grade` ，终端输出如下：
+
+```bash
+  -sh execve:                                OK
+  -user sh :                                 OK
+Total Score: 100/100
+```
+
+虚拟文件系统（VFS）能够正确挂载磁盘，内核能够正确执行用户程序，用户态 shell 程序能够正常运行，测试脚本成功通过。
